@@ -321,6 +321,47 @@ function power_law_fit_eval(p::AbstractVector, x0::AbstractVector)
 end
 
 """
+    extrapolation_distance(pedmodel::EPED1NNmodel, x::AbstractVector{<:Real})
+
+Compute a normalized extrapolation distance for each input relative to the training bounds.
+
+Returns a named tuple with:
+  - `per_input`: Dict mapping input name to its normalized distance (0 = within bounds)
+  - `max_distance`: worst-case distance across all inputs
+  - `worst_input`: name of the input furthest outside bounds
+
+Distance is measured as fraction of the training range: `(x - bound) / (bound_max - bound_min)`.
+A value of 0.5 means the input is half a training-range-width outside the bounds.
+"""
+function extrapolation_distance(pedmodel::EPED1NNmodel, x::AbstractVector{<:Real})
+    per_input = Dict{String,Float64}()
+    max_dist = 0.0
+    worst = ""
+    for ix in eachindex(x)
+        xmin = pedmodel.xbounds[ix, 1]
+        xmax = pedmodel.xbounds[ix, 2]
+        range_ix = xmax - xmin
+        if range_ix <= 0.0
+            continue
+        end
+        dist = max(0.0, (xmin - x[ix]) / range_ix, (x[ix] - xmax) / range_ix)
+        per_input[pedmodel.xnames[ix]] = dist
+        if dist > max_dist
+            max_dist = dist
+            worst = pedmodel.xnames[ix]
+        end
+    end
+    return (per_input=per_input, max_distance=max_dist, worst_input=worst)
+end
+
+function extrapolation_distance(pedmodel::EPED1NNmodel, input::InputEPED)
+    x = [input.a, input.betan, input.bt, input.delta, input.ip, input.kappa, input.m, input.neped, input.r, input.zeffped]
+    return extrapolation_distance(pedmodel, x)
+end
+
+export extrapolation_distance
+
+"""
     effective_triangularity(tri_lo::T, tri_up::T) where {T<:Real}a
 
 Effective triangularity to be used as an EPED input. Defined as:

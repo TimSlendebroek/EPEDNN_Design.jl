@@ -4,6 +4,7 @@ import Flux
 import Dates
 import Memoize
 import BSON
+import JSON
 
 #= ===================================== =#
 #  structs/constructors for the EPEDmodel
@@ -373,6 +374,154 @@ function effective_triangularity(tri_lo::T, tri_up::T) where {T<:Real}
     tri_max = max(tri_lo, tri_up)
     return (2.0 / 3.0) * tri_min + (1.0 / 3.0) * tri_max
 end
+
+#= ====================================================== =#
+#  EPED-NN deep ensemble (12-input, height-only, with UQ)
+#= ====================================================== =#
+# 5-model deep ensemble predicting the pedestal HEIGHT p_E1 (MPa), with an ensemble σ for UQ.
+# Adds nesep_ratio and tesep over the legacy 10-input EPED1NNmodel. Trained on the old
+# multi-machine DB + new ITER omega-star scans (iter_claude/eped/train_ensemble.py). The forward
+# pass is a faithful port of eped/eped-api/server.py (validated to reproduce its predictions).
+
+const ENSEMBLE_INPUT_COLS = ["a", "betan", "bt", "delta", "ip", "kappa", "m", "neped", "nesep_ratio", "r", "tesep", "zeffped"]
+
+struct EPEDNNEnsemble <: EPEDmodel
+    models::Vector{Vector{Tuple{Matrix{Float64},Vector{Float64}}}}  # [model][layer] = (W (out,in), b)
+    xm::Vector{Float64}
+    xs::Vector{Float64}
+    ym::Vector{Float64}
+    ys::Vector{Float64}
+    yp::Matrix{Float64}       # power-law coeffs (n_out, 13): [bias, 12 log-input coeffs]
+    xbounds::Matrix{Float64}  # (12, 2) on the transformed (delta+1, abs) inputs
+    n_inputs::Int
+    n_outputs::Int
+end
+
+_ensemble_gelu(x) = 0.5 * x * (1.0 + tanh(sqrt(2.0 / pi) * (x + 0.044715 * x^3)))
+
+function _ensemble_layers(raw)
+    layers = Tuple{Matrix{Float64},Vector{Float64}}[]
+    for li in (0, 2, 4, 6)  # Linear layers in the Sequential (GELU at 1,3,5)
+        wrows = raw["net.$(li).weight"]                              # PyTorch [out][in]
+        W = permutedims(reduce(hcat, [Float64.(r) for r in wrows])) # -> (out, in)
+        b = Float64.(raw["net.$(li).bias"])
+        push!(layers, (W, b))
+    end
+    return layers
+end
+
+_rows_to_matrix(rows) = reduce(vcat, [permutedims(Float64.(r)) for r in rows])
+
+"""
+    loadensemble(dirname="eped_ensemble")
+
+Load the 5-model EPED-NN ensemble from `data/<dirname>/` (`preprocessing.json` + `model_{0-4}_weights.json`).
+"""
+Memoize.@memoize function loadensemble(dirname::String="eped_ensemble")
+    base = joinpath(Base.dirname(Base.dirname(@__FILE__)), "data", dirname)
+    pp = JSON.parsefile(joinpath(base, "preprocessing.json"))
+    models = [_ensemble_layers(JSON.parsefile(joinpath(base, "model_$(m)_weights.json"))) for m in 0:4]
+    return EPEDNNEnsemble(
+        models,
+        Float64.(pp["xm"]), Float64.(pp["xs"]),
+        Float64.(pp["ym"]), Float64.(pp["ys"]),
+        _rows_to_matrix(pp["yp"]), _rows_to_matrix(pp["xbounds"]),
+        Int(pp["n_inputs"]), Int(pp["n_outputs"]))
+end
+
+function _ensemble_forward(model, x::Vector{Float64})
+    n = length(model)
+    for (i, (W, b)) in enumerate(model)
+        x = W * x .+ b
+        i < n && (x = _ensemble_gelu.(x))
+    end
+    return x
+end
+
+# Transform a raw 12-input vector the way training did: delta+1, then abs() of everything.
+_ensemble_xabs(x12::AbstractVector{<:Real}) = (xabs = collect(float.(x12)); xabs[4] += 1.0; abs.(xabs))
+
+"""
+    ensemble_predict(ens::EPEDNNEnsemble, x12) -> (mean, std)
+
+Pedestal height p_E1 (MPa): ensemble mean and population std over the 5 nets.
+`x12` is in `ENSEMBLE_INPUT_COLS` order.
+"""
+function ensemble_predict(ens::EPEDNNEnsemble, x12::AbstractVector{<:Real})
+    @assert length(x12) == 12 "ensemble expects 12 inputs in ENSEMBLE_INPUT_COLS order"
+    xabs = _ensemble_xabs(x12)
+    xnorm = (xabs .- ens.xm) ./ ens.xs
+    logx = log.(max.(xabs, 1e-30))
+    ypl = [exp(ens.yp[k, 1] + sum(@view(ens.yp[k, 2:end]) .* logx)) for k in 1:ens.n_outputs]
+    preds = Vector{Float64}(undef, length(ens.models))
+    for (j, model) in enumerate(ens.models)
+        resid = _ensemble_forward(model, xnorm) .* ens.ys .+ ens.ym
+        y = (ypl .+ resid) .^ 2
+        preds[j] = y[1] * xabs[8]   # undo density normalization (height = output 1; neped at idx 8)
+    end
+    μ = sum(preds) / length(preds)
+    σ = sqrt(sum((preds .- μ) .^ 2) / length(preds))   # population std (matches numpy default)
+    return (mean=μ, std=σ)
+end
+
+"""
+    extrapolation_distance(ens::EPEDNNEnsemble, x12)
+
+Per-axis normalized distance outside the (transformed) training bounds; 0 = inside the box.
+"""
+function extrapolation_distance(ens::EPEDNNEnsemble, x12::AbstractVector{<:Real})
+    xabs = _ensemble_xabs(x12)
+    per = Dict{String,Float64}()
+    max_dist = 0.0
+    worst = ""
+    for ix in eachindex(xabs)
+        xmin, xmax = ens.xbounds[ix, 1], ens.xbounds[ix, 2]
+        rng = xmax - xmin
+        rng <= 0.0 && continue
+        d = max(0.0, (xmin - xabs[ix]) / rng, (xabs[ix] - xmax) / rng)
+        per[ENSEMBLE_INPUT_COLS[ix]] = d
+        if d > max_dist
+            max_dist = d
+            worst = ENSEMBLE_INPUT_COLS[ix]
+        end
+    end
+    return (per_input=per, max_distance=max_dist, worst_input=worst)
+end
+
+"""
+    ensemble_uncertainty(ens, x12; sigma_threshold=0.05)
+
+Combined out-of-distribution UQ for one operating point. Returns a NamedTuple:
+  - `height`, `sigma`      : ensemble mean & std of p_E1 (MPa)
+  - `sigma_frac`           : sigma/height (ensemble fractional uncertainty)
+  - `extrapolation`        : max per-axis normalized distance outside training bounds (0 = in-box)
+  - `sigma_frac_combined`  : max(sigma_frac, extrapolation) — ensemble σ% in-box, geometric out-of-box
+  - `in_distribution`      : sigma_frac < sigma_threshold && extrapolation == 0
+
+σ% catches in-box-but-off-manifold points where the ensemble disagrees; the geometric distance
+catches deep extrapolation where the ensemble collapses onto the power law (false confidence). The
+two are complementary — see iter_claude/eped/CLAUDE.md "UQ as an out-of-distribution filter".
+"""
+function ensemble_uncertainty(ens::EPEDNNEnsemble, x12::AbstractVector{<:Real}; sigma_threshold::Real=0.05)
+    p = ensemble_predict(ens, x12)
+    extr = extrapolation_distance(ens, x12).max_distance
+    sfrac = p.std / max(p.mean, 1e-30)
+    return (height=p.mean, sigma=p.std, sigma_frac=sfrac, extrapolation=extr,
+        sigma_frac_combined=max(sfrac, extr),
+        in_distribution=(sfrac < sigma_threshold && extr == 0.0))
+end
+
+"""
+    ensemble_uncertainty(ens, input::InputEPED; nesep_ratio=0.25, tesep=75.0, sigma_threshold=0.05)
+
+Convenience wrapper from the legacy 10-input `InputEPED` (supplies the two new inputs).
+"""
+function ensemble_uncertainty(ens::EPEDNNEnsemble, input::InputEPED; nesep_ratio::Real=0.25, tesep::Real=75.0, sigma_threshold::Real=0.05)
+    x12 = [input.a, input.betan, input.bt, input.delta, input.ip, input.kappa, input.m, input.neped, nesep_ratio, input.r, tesep, input.zeffped]
+    return ensemble_uncertainty(ens, x12; sigma_threshold)
+end
+
+export loadensemble, ensemble_predict, ensemble_uncertainty
 
 const document = Dict()
 document[Symbol(@__MODULE__)] = [name for name in Base.names(@__MODULE__; all=false, imported=false) if name != Symbol(@__MODULE__)]

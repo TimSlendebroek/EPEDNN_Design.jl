@@ -1,0 +1,46 @@
+cff-version: 1.2.0
+message: "If you use this software (the EPED-NN deep ensemble or the EPEDexplorer), please cite this repository."
+title: "EPEDNN_Design.jl — EPED-NN deep ensemble with uncertainty quantification"
+abstract: >-
+  A fork of EPEDNN.jl adding a 12-input, height-only deep ensemble (with uncertainty
+  quantification and out-of-distribution detection) for the tokamak H-mode pedestal,
+  trained on the multi-machine EPED database plus new ITER-scale EPED scans. Powers the
+  EPEDexplorer (https://iter.fuseexplorer.com/EPED).
+type: software
+authors:
+  - family-names: Slendebroek
+    given-names: Tim
+    email: tim@slendebroek.com
+version: "1.1.0"
+date-released: "2026-06-04"
+license: Apache-2.0
+url: "https://iter.fuseexplorer.com/EPED"
+repository-code: "https://github.com/TimSlendebroek/EPEDNN_Design.jl"
+keywords:
+  - tokamak
+  - pedestal
+  - EPED
+  - neural network
+  - deep ensemble
+  - uncertainty quantification
+references:
+  - type: article
+    title: "Self-consistent core-pedestal transport simulations with neural network accelerated models"
+    authors:
+      - family-names: Meneghini
+        given-names: O.
+    journal: "Nuclear Fusion"
+    volume: 57
+    start: 086034
+    year: 2017
+    doi: "10.1088/1741-4326/aa7776"
+  - type: article
+    title: "Edge localized modes and the pedestal: A model based on coupled peeling-ballooning modes"
+    authors:
+      - family-names: Snyder
+        given-names: P. B.
+    journal: "Physics of Plasmas"
+    volume: 9
+    start: 2037
+    year: 2002
+    doi: "10.1063/1.1449463"

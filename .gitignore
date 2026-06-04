@@ -35,3 +35,6 @@ Manifest.toml
 # temp/test files
 test.json
 asd.jl
+
+# Local Claude context (not shipped)
+CLAUDE.md
